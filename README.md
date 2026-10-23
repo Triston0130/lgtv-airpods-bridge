@@ -132,9 +132,8 @@ The remaining 40–120 ms bursts were on the router-to-Mac leg. Some coincided w
 
 - **`health.sh`:** per-second radio, TCP and memory telemetry. Copy it and `wlpriv` to `/tmp/airpods-bridge/` on the TV and run it over SSH.
 - **`wlpriv`:** a minimal `iwpriv` for the TV's `mt7662u_sta` Wi-Fi driver (`stat`, `show NAME`, `set NAME=VALUE`).
-- **`wifi-watchdog.sh` + `68-wifi-watchdog`:** opt-in Homebrew Channel startup hook. Install it only if you want it, and remove both to uninstall.
-  - If the Wi-Fi stays dead for 30 s, it saves evidence to `/var/lib/webosbrew/wifi-watchdog/`.
-  - It then restarts `wlan0`, then re-authorizes the USB Wi-Fi module. Its USB ID is set for the 49UK6200's module (043e:3107); change `usbdev()` for others.
+- **`wifi-watchdog.sh` + `68-wifi-watchdog`:** Homebrew Channel startup hook for the test TV. It saves evidence on the first failed gateway probe under `/var/lib/webosbrew/wifi-watchdog/`. If the Wi-Fi association is lost for about 8 s, it asks `wpa_supplicant` to reconnect; after about 18 s it restarts `wlan0`. If the association remains up but the gateway is unreachable, it waits 30 s before restarting the interface. A still-dead link gets a USB Wi-Fi re-authorization 20 s later, with a 10-minute cooldown. The USB ID is specific to the 49UK6200's module (043e:3107).
+  - The radio's USB `power/control` is already `on`, so autosuspend is not the observed cause. The driver reports high receive CRC counts even while the link works; this is recorded for diagnosis, not used alone to force a reset.
 - **`tools/udp-probe.py`:** splits packet delay into TV-side and network-side parts. Run it only while the bridge is stopped.
 
 ## Porting
