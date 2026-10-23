@@ -1,0 +1,6 @@
+#!/bin/sh
+# Remote button remapping (edited in Launcher > Settings > Remote buttons). It waits until the UI has opened the
+# virtual keyboard and only then takes over the remote; until then, or if anything fails, the remote is stock.
+# To turn it off: rm /var/lib/webosbrew/init.d/62-remote-remap and reboot (or kill remote-remap.py).
+( setsid nohup /usr/bin/python /var/lib/webosbrew/remote-remap.py >>/tmp/remote-remap.err 2>&1 </dev/null & )
+exit 0

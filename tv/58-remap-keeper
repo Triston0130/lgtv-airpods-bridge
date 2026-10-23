@@ -1,0 +1,5 @@
+#!/bin/sh
+# Creates the virtual keyboard the remote remapper sends keys through. It must exist before surface-manager
+# (re)starts, because the UI only looks for input devices at start-up. 60-ysm-boot restarts it a little later.
+( setsid nohup /usr/bin/python /var/lib/webosbrew/remote-remap-out.py >>/tmp/remap-out.err 2>&1 </dev/null & )
+exit 0

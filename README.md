@@ -96,6 +96,14 @@ Selecting AirPods or AirPods + TV starts streaming; choosing a TV output stops i
 
 On this TV, remote volume keys are handled by an existing Python 2 remote remapper (`/var/lib/webosbrew/remote-remap.py`). `python3 tv/install_remote_keys.py` installs the tested AirPods extension only when that remapper's fingerprint matches. The original is saved as `remote-remap.py.before-airpods`. While AirPods-only is active, volume and mute control the AirPods without unmuting the TV. In AirPods + TV mode the keys also keep their normal TV action. The Mac player's volume changes live in 5-point steps.
 
+### What survives a restart
+
+- The Settings and Quick Settings copies, remapper, and their startup hooks live under `/var/lib/webosbrew` on the TV. They survive a normal reboot. This repo also keeps the remapper's virtual-keyboard helper, startup hooks, and a snapshot of the current button map in `tv/` so that setup is recoverable.
+- The Mac agent runs from this checkout through a `KeepAlive` LaunchAgent. Its private `config.json`, `agent-token`, and saved choice stay local and are ignored by Git. Keep the checkout at the same path while the agent is installed. Re-run `python3 agent.py install` if you move it.
+- The capture binary and active volume-key route live under `/tmp/airpods-bridge` on the TV. They are created again when streaming starts; losing them on reboot is expected. One-off diagnostics in `/tmp` are also temporary.
+
+For a full machine or TV replacement, restore the private SSH key and `config.json` separately, build the binaries, install the Mac agent, then reinstall the TV menus. The committed files preserve the code; private credentials are intentionally not in Git.
+
 ### Link health
 
 The relay pings the helper 10 times a second over the same socket. If the median round trip exceeds 80 ms, or a third of pings are lost, for 5 s, the TV runs `wpa_cli reassociate`, at most once a minute.
