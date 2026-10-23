@@ -1,0 +1,14 @@
+# Local settings
+config.json
+
+# Build outputs
+capture
+player
+wlpriv
+
+# Runtime state and logs
+*.log
+relay.pid
+relay-state.json
+relay-state.tmp
+__pycache__/
