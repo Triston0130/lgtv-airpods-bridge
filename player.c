@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define RATE 48000
@@ -48,7 +49,8 @@ static double monotonic_seconds(void) {
 }
 
 static int any_output;
-static void describe_device(void) {
+/* Default output device and its name; the name is empty if CoreAudio has none. */
+static AudioDeviceID default_output(char *text, size_t length) {
     AudioDeviceID device = 0;
     UInt32 size = sizeof(device);
     AudioObjectPropertyAddress address = {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -56,11 +58,19 @@ static void describe_device(void) {
     CFStringRef name = NULL;
     address.mSelector = kAudioObjectPropertyName;
     size = sizeof(name);
-    char text[256] = {0};
+    text[0] = 0;
     if (!AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &name) && name) {
-        CFStringGetCString(name, text, sizeof(text), kCFStringEncodingUTF8);
+        CFStringGetCString(name, text, length, kCFStringEncodingUTF8);
         CFRelease(name);
     }
+    return device;
+}
+
+static void describe_device(void) {
+    char text[256];
+    AudioDeviceID device = default_output(text, sizeof(text));
+    UInt32 size;
+    AudioObjectPropertyAddress address = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     fprintf(stderr, "output_device=%s device_id=%u\n", text, device);
     output_device=device;
     if (!any_output && !strcasestr(text, "AirPods")) {
@@ -185,6 +195,13 @@ static void output(void *user, AudioQueueRef queue, AudioQueueBufferRef buffer) 
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--default-output")) {
+        /* Fast presence check for the relay and agent (system_profiler takes about a second). */
+        char text[256];
+        default_output(text, sizeof(text));
+        puts(text);
+        return 0;
+    }
     float volume = argc > 1 ? atof(argv[1])/100.0f : 0.35f;
     if (volume < 0 || volume > 1) return 2;
     int target_ms = argc > 2 ? atoi(argv[2]) : 80;
@@ -218,8 +235,23 @@ int main(int argc, char **argv) {
     if (status) { fprintf(stderr, "AudioQueueStart: %d\n", status); return 1; }
     fprintf(stderr, "PLAYING stereo PCM 48000 Hz/16-bit; hardware blocks=3 x 512 frames; target=%dms, ceiling=250ms\n", target_ms);
     int lost_device=0;
+    /* Live volume: the relay rewrites this file (0-100) when the remote's volume keys are pressed. */
+    const char *volume_file = getenv("AIRPODS_PLAYER_VOLUME_FILE");
+    struct timespec volume_mtime = {0, 0};
     while (!stopping && !ended) {
         usleep(100000);
+        struct stat info;
+        if (volume_file && !stat(volume_file, &info) &&
+            (info.st_mtimespec.tv_sec != volume_mtime.tv_sec || info.st_mtimespec.tv_nsec != volume_mtime.tv_nsec)) {
+            volume_mtime = info.st_mtimespec;
+            FILE *file = fopen(volume_file, "r");
+            float level;
+            if (file && fscanf(file, "%f", &level) == 1 && level >= 0 && level <= 100) {
+                AudioQueueSetParameter(queue, kAudioQueueParam_Volume, level/100.0f);
+                fprintf(stderr, "volume=%.0f\n", level);
+            }
+            if (file) fclose(file);
+        }
         UInt32 alive=0, size=sizeof(alive);
         AudioObjectPropertyAddress address={kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
         if (AudioObjectGetPropertyData(output_device, &address, 0, NULL, &size, &alive) || !alive) {

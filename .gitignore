@@ -11,4 +11,9 @@ wlpriv
 relay.pid
 relay-state.json
 relay-state.tmp
+agent-token
+agent-choice.json
+player-volume
+player-volume-saved
+player-volume.tmp
 __pycache__/

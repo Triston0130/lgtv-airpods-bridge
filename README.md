@@ -46,7 +46,7 @@ The first time, macOS may ask whether Python can accept incoming network connect
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--volume N` | 35 | Player volume, 0–100 |
+| `--volume N` | last remote level, initially 35 | Player volume, 0–100 |
 | `--buffer-ms N` | 70 | Jitter-buffer target, 20–200. Lower is closer to lip sync; too low drops out during Wi-Fi stalls. |
 | `--mute-tv` | off | Mute the TV's own output while streaming |
 | `--no-game-mode` | off | Leave macOS Game Mode alone. By default it is forced on while streaming, because Apple says it lowers AirPods latency, and set back to automatic on stop. |
@@ -79,6 +79,22 @@ Each 10 ms chunk is one UDP datagram: sequence number, the TV's send time, then 
 - The TV keeps the last 1.28 s of packets.
 - The Mac reorders by sequence number and `NACK`s gaps immediately, repeating every 20 ms. It conceals a chunk only once its deadline passes: repeat for short gaps, silence for long ones.
 - SSH only launches the helper and owns its lifetime. The helper exits when its session goes away.
+
+### TV menus and remote volume
+
+The optional Mac agent lets the TV's full Settings and Quick Settings menus start the bridge. Connect and select the AirPods as the Mac's output, then run:
+
+```sh
+python3 agent.py install
+python3 tv/install_settings.py --check   # before the menus have been installed
+python3 tv/install_settings.py
+```
+
+The menu installer copies the stock Settings and Quick Settings files, patches the copies, and bind-mounts them at boot. It checks the stock file hashes before mounting, so a changed firmware leaves the stock menu in place. Quick Settings may need a TV restart to load the patched QML. Run `/var/lib/webosbrew/airpods-bridge/uninstall-settings.sh` on the TV to remove the menu changes.
+
+Selecting AirPods or AirPods + TV starts streaming; choosing a TV output stops it. The agent remembers the last AirPods choice and reconnects when they become the Mac's output again. The TV must be able to reach the Mac on TCP port 47801.
+
+On this TV, remote volume keys are handled by an existing Python 2 remote remapper (`/var/lib/webosbrew/remote-remap.py`). `python3 tv/install_remote_keys.py` installs the tested AirPods extension only when that remapper's fingerprint matches. The original is saved as `remote-remap.py.before-airpods`. While AirPods-only is active, volume and mute control the AirPods without unmuting the TV. In AirPods + TV mode the keys also keep their normal TV action. The Mac player's volume changes live in 5-point steps.
 
 ### Link health
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream an LG TV's audio to AirPods through a Mac: native DSP capture on the TV, UDP with selective resend, AudioQueue playback."""
+"""Relay native LG TV PCM over the saved SSH connection to the Mac's audio output."""
 import argparse
 import array
 import json
@@ -46,6 +46,15 @@ def active_pid():
 def require_airpods():
     if os.environ.get('AIRPODS_BRIDGE_TEST_OUTPUT') == '1':
         return 'test output (any device)'
+    try:
+        # The native player answers in well under a second, with almost no CPU.
+        name = subprocess.run([str(ROOT/'player'), '--default-output'], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        name = ''
+    if name:
+        if 'airpod' not in name.lower():
+            raise RuntimeError('Select your AirPods as the Mac sound output first. Current output: '+name)
+        return name
     result = subprocess.run(['system_profiler', 'SPAudioDataType', '-json'], capture_output=True, text=True, check=True, timeout=15)
     data = json.loads(result.stdout)
     for group in data.get('SPAudioDataType', []):
@@ -114,7 +123,7 @@ class Recovery:
     def _nack(self, sequences):
         for i in range(0, len(sequences), 64):
             batch = sequences[i:i+64]
-            self.sock.send(b'NACK'+b''.join(q.to_bytes(4, 'little') for q in batch))
+            self.sock.sendto(b'NACK'+b''.join(q.to_bytes(4, 'little') for q in batch), self.sock_peer)
             self.stats['nacks'] += 1
 
     def service(self, now):
@@ -143,8 +152,8 @@ class LinkHealth:
     """Pings the TV over the stream socket and refreshes its Wi-Fi association when the downlink degrades."""
     WINDOW_S, MEDIAN_LIMIT_S, LOSS_LIMIT, COOLDOWN_S = 5.0, 0.08, 0.33, 60.0
 
-    def __init__(self, sock):
-        self.sock = sock
+    def __init__(self, sock, peer):
+        self.sock, self.peer = sock, peer
         self.sent = {}       # ping id -> send time
         self.samples = []    # (send time, rtt or None)
         self.next_id = 0
@@ -160,7 +169,7 @@ class LinkHealth:
 
     def service(self, now):
         if now-self.last_ping >= 0.1:
-            self.sock.send(b'PING'+self.next_id.to_bytes(4, 'little'))
+            self.sock.sendto(b'PING'+self.next_id.to_bytes(4, 'little'), self.peer)
             self.sent[self.next_id] = now
             self.next_id += 1
             self.last_ping = now
@@ -177,12 +186,49 @@ class LinkHealth:
         self.stats.update(rtt_p50_ms=round(median*1000, 1), rtt_p90_ms=round(rtts[int(len(rtts)*0.9)]*1000, 1) if rtts else None, ping_loss=round(loss, 2))
         if (median > self.MEDIAN_LIMIT_S or loss > self.LOSS_LIMIT) and now-self.last_reassoc > self.COOLDOWN_S:
             for _ in range(3):
-                self.sock.send(b'RASC')
+                self.sock.sendto(b'RASC', self.peer)
             self.last_reassoc = now
             self.stats['reassociations'] += 1
             with (ROOT/'link.log').open('a') as log:
                 log.write('%s reassociate: median %.0f ms, loss %.0f%%\n' % (time.strftime('%F %T'), median*1000, loss*100))
             self.samples.clear()
+
+VOLUME_FILE = ROOT/'player-volume'
+
+
+class RemoteKeys:
+    """The remote's volume keys while the bridge runs (forwarded by the TV's remote remapper): 5% steps, mute toggles.
+    The player watches player-volume; player-volume-saved keeps the unmuted level across starts."""
+    STEP = 5
+
+    def __init__(self, requested):
+        saved = None
+        try:
+            saved = int((ROOT/'player-volume-saved').read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        self.level = int(requested if requested is not None else (saved if saved is not None and 0 <= saved <= 100 else 35))
+        self.muted = False
+        self.write()
+
+    def press(self, name):
+        if name == 'vol_up':
+            self.level, self.muted = min(100, self.level+self.STEP), False
+        elif name == 'vol_down':
+            self.level, self.muted = max(0, self.level-self.STEP), False
+        elif name == 'mute':
+            self.muted = not self.muted
+        else:
+            return
+        self.write()
+
+    def write(self):
+        temporary = VOLUME_FILE.with_suffix('.tmp')
+        temporary.write_text('%d\n' % (0 if self.muted else self.level))
+        temporary.replace(VOLUME_FILE)
+        if not self.muted:
+            # Remember the level itself, not the muted 0, for the next start.
+            (ROOT/'player-volume-saved').write_text('%d\n' % self.level)
 
 def local_address():
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -233,7 +279,7 @@ def run(volume, buffer_ms, transport, recover_ms=50, use_game_mode=True, mute_tv
             raise RuntimeError('Could not mute the TV through com.webos.audio')
         restore_tv_mute = bool(status.get('muted'))
     PID.write_text(str(os.getpid())+'\n')
-    ssh = player = receiver = recovery = None
+    ssh = player = receiver = recovery = keys = None
     byte_count = peak = window_peak = 0
     started = time.monotonic()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -256,8 +302,11 @@ def run(volume, buffer_ms, transport, recover_ms=50, use_game_mode=True, mute_tv
                 if service >= 0:
                     receiver.setsockopt(socket.SOL_SOCKET, 0x1116, service)  # SO_NET_SERVICE_TYPE: tell macOS this is real-time
                 command += ' 0 %s %d %s' % (address, UDP_PORT, os.environ.get('AIRPODS_BRIDGE_TOS', '0x00'))
+                command = 'echo "%s %s %d $$" > /tmp/airpods-bridge/route; %s' % ('only' if mute_tv else 'both', address, UDP_PORT, command)
             ssh = subprocess.Popen(tv.SSH[:-1] + ['-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', tv.SSH[-1], command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=capture_log, bufsize=0)
-            player = subprocess.Popen([str(ROOT/'player'), str(volume), str(buffer_ms)] + (['any'] if os.environ.get('AIRPODS_BRIDGE_TEST_OUTPUT') == '1' else []), stdin=subprocess.PIPE, stdout=player_log, stderr=player_log, bufsize=0)
+            keys = RemoteKeys(volume)
+            player = subprocess.Popen([str(ROOT/'player'), str(keys.level), str(buffer_ms)] + (['any'] if os.environ.get('AIRPODS_BRIDGE_TEST_OUTPUT') == '1' else []), stdin=subprocess.PIPE, stdout=player_log, stderr=player_log, bufsize=0,
+                                      env=dict(os.environ, AIRPODS_PLAYER_VOLUME_FILE=str(VOLUME_FILE)))
             update(status='starting', pid=os.getpid(), output=output_name, bytes=0)
             last_update = 0
             import selectors
@@ -294,14 +343,16 @@ def run(volume, buffer_ms, transport, recover_ms=50, use_game_mode=True, mute_tv
                                 arrived = seconds + micros/1e6
                         if test_drop and random.random() < test_drop:
                             continue  # test switch: simulate Wi-Fi loss to exercise recovery
+                        if sender[0] == tv.HOST and packet[:4] == b'KEY ':
+                            keys.press(packet[4:].strip().decode('ascii', 'replace'))
+                            continue
                         if sender[0] == tv.HOST and packet[:4] == b'PONG' and health:
                             health.pong(packet, now)
                             continue
                         if sender[0] == tv.HOST and len(packet) == 8+CHUNK:
                             if recovery.sock_peer is None:
                                 recovery.sock_peer = sender
-                                receiver.connect(sender)
-                                health = LinkHealth(receiver)
+                                health = LinkHealth(receiver, sender)
                             recovery.receive(int.from_bytes(packet[:4], 'little'), packet[8:], now, int.from_bytes(packet[4:8], 'little'), arrived)
                     if health:
                         health.service(now)
@@ -327,7 +378,7 @@ def run(volume, buffer_ms, transport, recover_ms=50, use_game_mode=True, mute_tv
                 byte_count += len(chunk)
                 now = time.monotonic()
                 if now-last_update > 1:
-                    update(status='playing', pid=os.getpid(), output=output_name, bytes=byte_count, audio_seconds=round(byte_count/192000, 3), elapsed_seconds=round(now-started, 3), peak=peak, peak_last_second=window_peak, volume=volume, transport=transport, **(recovery.stats if recovery else {}), **(health.stats if recovery and health else {}))
+                    update(status='playing', pid=os.getpid(), output=output_name, bytes=byte_count, audio_seconds=round(byte_count/192000, 3), elapsed_seconds=round(now-started, 3), peak=peak, peak_last_second=window_peak, volume=keys.level, airpods_muted=keys.muted, transport=transport, mode='only' if mute_tv else 'both', **(recovery.stats if recovery else {}), **(health.stats if recovery and health else {}))
                     last_update = now
                     window_peak = 0
             update(status='stopping', bytes=byte_count, output=output_name)
@@ -356,14 +407,14 @@ def run(volume, buffer_ms, transport, recover_ms=50, use_game_mode=True, mute_tv
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['start', 'stop', 'status', '_run'])
-    parser.add_argument('--volume', type=int, default=35)  # 0 is allowed; useful for silent tests
+    parser.add_argument('--volume', type=int, default=None)  # 0 is allowed; omitted uses the last remote level
     parser.add_argument('--transport', choices=['udp', 'ssh'], default='udp', help='udp: sequenced datagrams with selective resend (default); ssh: PCM inside the SSH channel, which stalls up to ~300 ms behind TCP')
     parser.add_argument('--no-game-mode', action='store_true', help='leave macOS Game Mode alone (by default it is on while streaming)')
     parser.add_argument('--mute-tv', action='store_true', help="mute the TV's own speakers or sound output while streaming; its previous mute state returns on stop (default: both play)")
     parser.add_argument('--recover-ms', type=int, default=50, help='udp: how long a missing packet may be re-requested before it is concealed')
     parser.add_argument('--buffer-ms', type=int, default=70, help='jitter buffer target, 20-200 ms; lower is closer to lip sync but drops out on Wi-Fi stalls')
     args = parser.parse_args()
-    if not 0 <= args.volume <= 100:
+    if args.volume is not None and not 0 <= args.volume <= 100:
         parser.error('volume must be between 0 and 100')
     if not 20 <= args.buffer_ms <= 200:
         parser.error('buffer-ms must be between 20 and 200')
@@ -372,7 +423,7 @@ def main():
             print('Relay already running.'); return
         output = require_airpods()
         with (ROOT/'relay.log').open('ab') as log:
-            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_run', '--volume', str(args.volume), '--buffer-ms', str(args.buffer_ms), '--transport', args.transport, '--recover-ms', str(args.recover_ms)] + (['--no-game-mode'] if args.no_game_mode else []) + (['--mute-tv'] if args.mute_tv else []), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_run', '--buffer-ms', str(args.buffer_ms), '--transport', args.transport, '--recover-ms', str(args.recover_ms)] + (['--volume', str(args.volume)] if args.volume is not None else []) + (['--no-game-mode'] if args.no_game_mode else []) + (['--mute-tv'] if args.mute_tv else []), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         print('Starting TV audio to '+output+' (relay PID '+str(process.pid)+').')
     elif args.command == 'stop':
         pid = active_pid()
